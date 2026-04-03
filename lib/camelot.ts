@@ -43,6 +43,9 @@ export function keyModeToCamelot(key: number, mode: 0 | 1): string {
   return mode === 1 ? majorByPitchClass[key] : minorByPitchClass[key];
 }
 
+// Alias to match the naming used by the UI requirement.
+export const getCamelotKey = keyModeToCamelot;
+
 export function camelotKeyToSortIndex(camelotKey: string): number {
   const match = camelotKey.match(/^(\d{1,2})([AB])$/);
   if (!match) return Number.MAX_SAFE_INTEGER;
