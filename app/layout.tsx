@@ -30,6 +30,8 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col bg-zinc-950 text-zinc-100">
         <AppProviders>{children}</AppProviders>
+        <a href="https://getsongbpm.com/">Powered by GetSongBPM</a>
+
       </body>
     </html>
   );
