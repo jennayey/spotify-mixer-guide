@@ -37,13 +37,13 @@ export async function fetchTrackFeatures(
     );
   }
 
-  // GetSongBPM docs: base URL https://api.getsongbpm.com, endpoint /search/
-  // Auth can be passed via query param `api_key` or header `X-API-KEY`.
-  // We'll do both for robustness.
-  const lookup = `song:${title} artist:${artist}`;
+  // GetSongBPM search works best with a simple "Artist Title" or "Artist - Title" string.
+  const lookup = `${artist} ${title}`;
   const url = `https://api.getsongbpm.com/search/?type=both&lookup=${encodeURIComponent(
     lookup
   )}&limit=1&api_key=${encodeURIComponent(apiKey)}`;
+
+  console.log(`[GetSongBPM] Searching for: "${lookup}"`);
 
   const res = await fetch(url, {
     method: "GET",
@@ -55,39 +55,37 @@ export async function fetchTrackFeatures(
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`GetSongBPM failed (${res.status}): ${body}`);
+    console.error(`[GetSongBPM] API Error (${res.status}):`, body);
+    throw new Error(`GetSongBPM failed (${res.status})`);
   }
 
-  const json: unknown = await res.json();
+  const json: any = await res.json();
 
-  const record = (() => {
-    if (Array.isArray(json)) return json[0];
-    if (typeof json === "object" && json !== null) {
-      const obj = json as Record<string, unknown>;
-      const arr = obj.data ?? obj.results ?? obj.items;
-      if (Array.isArray(arr)) return arr[0];
-    }
-    return undefined;
-  })();
+  // The GetSongBPM search API typically returns: { search: [ { id, song_title, artist: { name }, tempo, key_of, ... } ] }
+  // or sometimes { data: [...] } or { results: [...] }
+  const record = json?.search?.[0] || json?.data?.[0] || json?.results?.[0] || (Array.isArray(json) ? json[0] : undefined);
 
-  const rec = typeof record === "object" && record !== null
-    ? (record as Record<string, unknown>)
-    : undefined;
+  if (!record) {
+    console.warn(`[GetSongBPM] No results found for: "${lookup}"`);
+    throw new Error(`No results found for "${title}" by "${artist}"`);
+  }
 
-  const bpmRaw = rec?.tempo ?? rec?.bpm;
-  const keyRaw = rec?.key_of ?? rec?.key;
-  const modeRaw = rec?.mode ?? rec?.key_mode;
+  const bpmRaw = record.tempo || record.bpm;
+  const keyRaw = record.key_of || record.key;
+  const modeRaw = record.mode || record.key_mode;
 
   const bpm = Number(bpmRaw);
   const key = clampInt(Number(keyRaw), 0, 11);
   const mode = parseMode(modeRaw);
 
   if (!Number.isFinite(bpm) || bpm <= 0 || key === undefined || mode === undefined) {
+    console.error(`[GetSongBPM] Invalid data for "${lookup}":`, { bpmRaw, keyRaw, modeRaw });
     throw new Error(
-      `GetSongBPM response parse failed for "${title}" - "${artist}"`
+      `GetSongBPM returned incomplete data for "${title}" - "${artist}"`
     );
   }
 
+  console.log(`[GetSongBPM] Found: ${bpm} BPM, Key: ${key}, Mode: ${mode}`);
   return { bpm, key, mode };
 }
 
