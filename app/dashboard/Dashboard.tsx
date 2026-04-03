@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -12,8 +12,17 @@ import {
   type SortingState,
   type Column,
 } from "@tanstack/react-table";
-import { ArrowUpDown, Headphones, LogOut, Music2, Sparkles } from "lucide-react";
-import { camelotKeyToSortIndex, keyModeToCamelot } from "@/lib/camelot";
+import {
+  ArrowUpDown,
+  Headphones,
+  Loader2,
+  LogOut,
+  Music2,
+  Sparkles,
+} from "lucide-react";
+import { camelotKeyToSortIndex, getCamelotKey } from "@/lib/camelot";
+import { fetchPlaylistTracks } from "@/app/actions/spotify";
+import { fetchTrackFeatures, type TrackFeatures } from "@/app/actions/getsongbpm";
 
 type SpotifyPlaylist = {
   id: string;
@@ -21,30 +30,14 @@ type SpotifyPlaylist = {
   images?: { url: string }[];
 };
 
-type SpotifyArtist = { name: string };
-
-type SpotifyImage = { url: string; width?: number; height?: number };
-
-type SpotifyTrack = {
-  id: string;
-  name: string;
-  artists: SpotifyArtist[];
-  album?: { images?: SpotifyImage[] };
-  external_ids?: { isrc?: string };
-};
-
-type PlaylistTracksResponse = {
-  items: Array<{ track: SpotifyTrack | null }>;
-};
-
-type HarmonizedTrack = {
-  id: string;
+type TableTrack = {
+  spotifyId: string;
   albumArtUrl?: string;
   trackName: string;
   artistName: string;
-  bpm: number;
-  camelotKey: string;
-  camelotSortIndex: number;
+  bpm?: number;
+  camelotKey?: string;
+  camelotSortIndex: number; // used for sorting even before enrichment
 };
 
 function getErrorMessage(err: unknown): string {
@@ -57,33 +50,12 @@ function getErrorMessage(err: unknown): string {
   }
 }
 
-function pickSmallestAlbumArt(images?: SpotifyImage[]): string | undefined {
-  if (!images || images.length === 0) return undefined;
-  return images[2]?.url ?? images[1]?.url ?? images[0]?.url;
-}
-
-async function fetchBPMAndKey(isrc: string): Promise<{
-  bpm: number;
-  key: number;
-  mode: 0 | 1;
-}> {
-  await new Promise((r) => setTimeout(r, 60));
-  let hash = 0;
-  for (let i = 0; i < isrc.length; i++) {
-    hash = (hash * 31 + isrc.charCodeAt(i)) >>> 0;
-  }
-  const bpm = 90 + (hash % 71);
-  const key = hash % 12;
-  const mode = ((hash >> 3) % 2) as 0 | 1;
-  return { bpm, key, mode };
-}
-
 function SortableHeader({
   label,
   column,
 }: {
   label: string;
-  column: Column<HarmonizedTrack, unknown>;
+  column: Column<TableTrack, unknown>;
 }) {
   const sortState = column.getIsSorted() as "asc" | "desc" | false;
   return (
@@ -142,53 +114,91 @@ export default function Dashboard() {
   }, [playlistsData, selectedPlaylistId]);
 
   const {
-    data: harmonizedTracks,
+    data: playlistTracks,
     isLoading: tracksLoading,
     isError: tracksError,
     error: tracksErr,
     isFetching: tracksFetching,
   } = useQuery({
-    queryKey: ["harmonizedTracks", selectedPlaylistId],
+    queryKey: ["playlistTracks", selectedPlaylistId],
     enabled: Boolean(accessToken && selectedPlaylistId),
     staleTime: 1000 * 60 * 10,
     queryFn: async () => {
       if (!selectedPlaylistId || !accessToken) return [];
-      const tracksLimit = 50;
-      const res = await fetch(
-        `https://api.spotify.com/v1/playlists/${selectedPlaylistId}/tracks?limit=${tracksLimit}&fields=items(track(id,name,artists(name),album(images),external_ids))`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      if (!res.ok) throw new Error(await res.text());
-      const json = (await res.json()) as PlaylistTracksResponse;
-      const tracks: SpotifyTrack[] = json.items
-        .map((it) => it.track)
-        .filter(Boolean) as SpotifyTrack[];
-
-      const harmonized = await Promise.all(
-        tracks.map(async (t) => {
-          const isrc = t.external_ids?.isrc ?? t.id;
-          const { bpm, key, mode } = await fetchBPMAndKey(isrc);
-          const camelotKey = keyModeToCamelot(key, mode);
-          const camelotSortIndex = camelotKeyToSortIndex(camelotKey);
-          return {
-            id: t.id,
-            albumArtUrl: pickSmallestAlbumArt(t.album?.images),
-            trackName: t.name,
-            artistName: (t.artists ?? []).map((a) => a.name).join(", "),
-            bpm,
-            camelotKey,
-            camelotSortIndex,
-          } satisfies HarmonizedTrack;
-        })
-      );
-
-      return harmonized;
+      return fetchPlaylistTracks(selectedPlaylistId, accessToken);
     },
   });
 
+  const [featuresById, setFeaturesById] = useState<Record<string, TrackFeatures>>(
+    {}
+  );
+  const [loadingTrackId, setLoadingTrackId] = useState<string | null>(null);
+  const enrichedIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    setFeaturesById({});
+    setLoadingTrackId(null);
+    enrichedIdsRef.current = new Set();
+  }, [selectedPlaylistId]);
+
+  // Enrich track rows one-by-one to avoid GetSongBPM rate limits.
+  useEffect(() => {
+    if (!playlistTracks || playlistTracks.length === 0) return;
+
+    let cancelled = false;
+
+    const run = async () => {
+      for (const t of playlistTracks) {
+        if (cancelled) return;
+        if (enrichedIdsRef.current.has(t.spotifyId)) continue;
+
+        setLoadingTrackId(t.spotifyId);
+        try {
+          const feat = await fetchTrackFeatures(t.trackName, t.artistName);
+          if (cancelled) return;
+          setFeaturesById((prev) => ({ ...prev, [t.spotifyId]: feat }));
+        } catch {
+          // If the external API fails for a row, keep BPM/Key empty.
+        } finally {
+          enrichedIdsRef.current.add(t.spotifyId);
+          setLoadingTrackId(null);
+        }
+      }
+    };
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [playlistTracks]);
+
   const [sorting, setSorting] = useState<SortingState>([{ id: "bpm", desc: false }]);
 
-  const columns = useMemo<ColumnDef<HarmonizedTrack>[]>(() => {
+  const tableTracks = useMemo<TableTrack[]>(
+    () =>
+      (playlistTracks ?? []).map((t) => {
+        const feat = featuresById[t.spotifyId];
+        const bpm = feat?.bpm;
+        const camelotKey = feat ? getCamelotKey(feat.key, feat.mode) : undefined;
+        const camelotSortIndex = camelotKey
+          ? camelotKeyToSortIndex(camelotKey)
+          : Number.MAX_SAFE_INTEGER;
+
+        return {
+          spotifyId: t.spotifyId,
+          albumArtUrl: t.albumArtUrl,
+          trackName: t.trackName,
+          artistName: t.artistName,
+          bpm,
+          camelotKey,
+          camelotSortIndex,
+        } satisfies TableTrack;
+      }),
+    [playlistTracks, featuresById]
+  );
+
+  const columns = useMemo<ColumnDef<TableTrack>[]>(() => {
     return [
       {
         id: "albumArt",
@@ -224,31 +234,63 @@ export default function Dashboard() {
       },
       {
         id: "bpm",
-        accessorFn: (row) => row.bpm,
+        accessorFn: (row) => row.bpm ?? null,
         header: ({ column }) => <SortableHeader label="BPM" column={column} />,
         enableSorting: true,
+        sortingFn: (rowA, rowB) =>
+          (rowA.original.bpm ?? Number.MAX_SAFE_INTEGER) -
+          (rowB.original.bpm ?? Number.MAX_SAFE_INTEGER),
         cell: ({ row }) => (
-          <span className="font-semibold text-zinc-100">{row.original.bpm}</span>
+          (() => {
+            const spotifyId = row.original.spotifyId;
+            const isLoading = loadingTrackId === spotifyId && row.original.bpm == null;
+            if (isLoading) {
+              return (
+                <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
+              );
+            }
+
+            if (row.original.bpm == null) return <span className="text-zinc-500">—</span>;
+
+            return (
+              <span className="font-semibold text-zinc-100">{row.original.bpm}</span>
+            );
+          })()
         ),
       },
       {
         id: "camelotKey",
-        accessorFn: (row) => row.camelotKey,
+        accessorFn: (row) => row.camelotKey ?? null,
         header: ({ column }) => <SortableHeader label="Camelot Key" column={column} />,
         enableSorting: true,
         sortingFn: (rowA, rowB) =>
           rowA.original.camelotSortIndex - rowB.original.camelotSortIndex,
         cell: ({ row }) => (
-          <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-200 border border-emerald-500/20">
-            {row.original.camelotKey}
-          </span>
+          (() => {
+            const spotifyId = row.original.spotifyId;
+            const isLoading =
+              loadingTrackId === spotifyId && !row.original.camelotKey;
+            if (isLoading) {
+              return (
+                <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
+              );
+            }
+
+            if (!row.original.camelotKey) return <span className="text-zinc-500">—</span>;
+
+            return (
+              <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-200 border border-emerald-500/20">
+                {row.original.camelotKey}
+              </span>
+            );
+          })()
         ),
       },
     ];
-  }, []);
+  }, [loadingTrackId]);
 
   const table = useReactTable({
-    data: harmonizedTracks ?? [],
+    data: tableTracks,
     columns,
     state: { sorting },
     onSortingChange: setSorting,
@@ -281,7 +323,7 @@ export default function Dashboard() {
                   Spotify Playlist Harmonizer
                 </h1>
                 <p className="text-zinc-400">
-                  DJ-friendly BPM + Camelot labeling (mock GetSongBPM).
+                  DJ-friendly BPM + Camelot labeling (GetSongBPM enrichment after track list render).
                 </p>
               </div>
             </div>
@@ -305,9 +347,9 @@ export default function Dashboard() {
                     <span>
                       Track harmonization: BPM + Camelot via{" "}
                       <code className="rounded bg-black/40 px-1 py-0.5 text-xs">
-                        fetchBPMAndKey(isrc)
+                        fetchTrackFeatures(title, artist)
                       </code>{" "}
-                      mock.
+                      (sequential to avoid rate limits).
                     </span>
                   </li>
                   <li className="flex gap-3">
@@ -365,6 +407,7 @@ export default function Dashboard() {
                       {selectedPlaylist?.name ?? "Select a playlist"}
                     </div>
                   </div>
+                  <p>BPM and Key data provided by <a href="https://getsongbpm.com/">GetSongBPM</a></p>
                 </div>
               </div>
 
@@ -438,7 +481,7 @@ export default function Dashboard() {
                   <div className="mt-4 overflow-x-auto">
                     {tracksLoading ? (
                       <div className="py-10 text-center text-zinc-400 text-sm">
-                        Harmonizing tracks (mock GetSongBPM)...
+                        Loading playlist tracks...
                       </div>
                     ) : tracksError ? (
                       <div className="py-10 text-center text-red-300 text-sm">
