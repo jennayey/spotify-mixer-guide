@@ -22,7 +22,11 @@ import {
 } from "lucide-react";
 import { camelotKeyToSortIndex, getCamelotKey } from "@/lib/camelot";
 import { fetchPlaylistTracks } from "@/app/actions/spotify";
-import { fetchTrackFeatures, type TrackFeatures } from "@/app/actions/getsongbpm";
+import {
+  EMPTY_TRACK_FEATURES,
+  fetchTrackFeatures,
+  type TrackFeatures,
+} from "@/app/actions/getsongbpm";
 
 type SpotifyPlaylist = {
   id: string;
@@ -35,9 +39,11 @@ type TableTrack = {
   albumArtUrl?: string;
   trackName: string;
   artistName: string;
-  bpm?: number;
+  bpm?: number | null;
+  keyOf?: string | number | null;
+  timeSig?: string | number | null;
   camelotKey?: string;
-  camelotSortIndex: number; // used for sorting even before enrichment
+  camelotSortIndex: number;
 };
 
 function getErrorMessage(err: unknown): string {
@@ -129,9 +135,8 @@ export default function Dashboard() {
     },
   });
 
-  const [featuresById, setFeaturesById] = useState<Record<string, TrackFeatures>>(
-    {}
-  );
+  /** Cache GetSong.co results by Spotify track id (avoids duplicate fetches on re-render). */
+  const [featuresById, setFeaturesById] = useState<Record<string, TrackFeatures>>({});
   const [loadingTrackId, setLoadingTrackId] = useState<string | null>(null);
   const enrichedIdsRef = useRef<Set<string>>(new Set());
 
@@ -141,16 +146,21 @@ export default function Dashboard() {
     enrichedIdsRef.current = new Set();
   }, [selectedPlaylistId]);
 
-  // Enrich track rows one-by-one to avoid GetSongBPM rate limits.
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  // Sequential enrichment + 300ms gap between requests (rate limiting).
   useEffect(() => {
     if (!playlistTracks || playlistTracks.length === 0) return;
 
     let cancelled = false;
 
     const run = async () => {
-      for (const t of playlistTracks) {
+      for (let i = 0; i < playlistTracks.length; i++) {
+        const t = playlistTracks[i];
         if (cancelled) return;
         if (enrichedIdsRef.current.has(t.spotifyId)) continue;
+
+        if (i > 0) await delay(300);
 
         setLoadingTrackId(t.spotifyId);
         try {
@@ -158,7 +168,10 @@ export default function Dashboard() {
           if (cancelled) return;
           setFeaturesById((prev) => ({ ...prev, [t.spotifyId]: feat }));
         } catch {
-          // If the external API fails for a row, keep BPM/Key empty.
+          setFeaturesById((prev) => ({
+            ...prev,
+            [t.spotifyId]: EMPTY_TRACK_FEATURES,
+          }));
         } finally {
           enrichedIdsRef.current.add(t.spotifyId);
           setLoadingTrackId(null);
@@ -180,7 +193,14 @@ export default function Dashboard() {
       (playlistTracks ?? []).map((t) => {
         const feat = featuresById[t.spotifyId];
         const bpm = feat?.bpm;
-        const camelotKey = feat ? getCamelotKey(feat.key, feat.mode) : undefined;
+        const keyOf = feat?.keyOf;
+        const timeSig = feat?.timeSig;
+        const camelotKey =
+          feat &&
+          typeof feat.key === "number" &&
+          (feat.mode === 0 || feat.mode === 1)
+            ? getCamelotKey(feat.key, feat.mode)
+            : undefined;
         const camelotSortIndex = camelotKey
           ? camelotKeyToSortIndex(camelotKey)
           : Number.MAX_SAFE_INTEGER;
@@ -191,6 +211,8 @@ export default function Dashboard() {
           trackName: t.trackName,
           artistName: t.artistName,
           bpm,
+          keyOf,
+          timeSig,
           camelotKey,
           camelotSortIndex,
         } satisfies TableTrack;
@@ -240,54 +262,121 @@ export default function Dashboard() {
         sortingFn: (rowA, rowB) =>
           (rowA.original.bpm ?? Number.MAX_SAFE_INTEGER) -
           (rowB.original.bpm ?? Number.MAX_SAFE_INTEGER),
-        cell: ({ row }) => (
-          (() => {
-            const spotifyId = row.original.spotifyId;
-            const isLoading = loadingTrackId === spotifyId && row.original.bpm == null;
-            if (isLoading) {
-              return (
-                <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
-              );
-            }
-
-            if (row.original.bpm == null) return <span className="text-zinc-500">—</span>;
-
+        cell: ({ row }) => {
+          const id = row.original.spotifyId;
+          const inCache = id in featuresById;
+          const loading = loadingTrackId === id && !inCache;
+          if (loading) {
             return (
-              <span className="font-semibold text-zinc-100">{row.original.bpm}</span>
+              <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
             );
-          })()
-        ),
+          }
+          if (!inCache) {
+            return <span className="text-zinc-500">—</span>;
+          }
+          if (row.original.bpm === null || row.original.bpm === undefined) {
+            return <span className="text-zinc-400">N/A</span>;
+          }
+          return (
+            <span className="font-semibold text-zinc-100">{row.original.bpm}</span>
+          );
+        },
+      },
+      {
+        id: "keyOf",
+        accessorFn: (row) =>
+          row.keyOf === null || row.keyOf === undefined
+            ? ""
+            : String(row.keyOf),
+        header: ({ column }) => <SortableHeader label="Key" column={column} />,
+        enableSorting: true,
+        sortingFn: (rowA, rowB) =>
+          String(rowA.original.keyOf ?? "").localeCompare(
+            String(rowB.original.keyOf ?? "")
+          ),
+        cell: ({ row }) => {
+          const id = row.original.spotifyId;
+          const inCache = id in featuresById;
+          const loading = loadingTrackId === id && !inCache;
+          if (loading) {
+            return (
+              <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
+            );
+          }
+          if (!inCache) {
+            return <span className="text-zinc-500">—</span>;
+          }
+          if (row.original.keyOf === null || row.original.keyOf === undefined) {
+            return <span className="text-zinc-400">N/A</span>;
+          }
+          return (
+            <span className="font-medium text-zinc-100">{String(row.original.keyOf)}</span>
+          );
+        },
+      },
+      {
+        id: "timeSig",
+        accessorFn: (row) =>
+          row.timeSig === null || row.timeSig === undefined
+            ? ""
+            : String(row.timeSig),
+        header: () => <span className="font-semibold">Time Sig.</span>,
+        enableSorting: true,
+        sortingFn: (rowA, rowB) =>
+          String(rowA.original.timeSig ?? "").localeCompare(
+            String(rowB.original.timeSig ?? "")
+          ),
+        cell: ({ row }) => {
+          const id = row.original.spotifyId;
+          const inCache = id in featuresById;
+          const loading = loadingTrackId === id && !inCache;
+          if (loading) {
+            return (
+              <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
+            );
+          }
+          if (!inCache) {
+            return <span className="text-zinc-500">—</span>;
+          }
+          if (row.original.timeSig === null || row.original.timeSig === undefined) {
+            return <span className="text-zinc-400">N/A</span>;
+          }
+          return (
+            <span className="text-zinc-100">{String(row.original.timeSig)}</span>
+          );
+        },
       },
       {
         id: "camelotKey",
         accessorFn: (row) => row.camelotKey ?? null,
-        header: ({ column }) => <SortableHeader label="Camelot Key" column={column} />,
+        header: ({ column }) => <SortableHeader label="Camelot" column={column} />,
         enableSorting: true,
         sortingFn: (rowA, rowB) =>
           rowA.original.camelotSortIndex - rowB.original.camelotSortIndex,
-        cell: ({ row }) => (
-          (() => {
-            const spotifyId = row.original.spotifyId;
-            const isLoading =
-              loadingTrackId === spotifyId && !row.original.camelotKey;
-            if (isLoading) {
-              return (
-                <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
-              );
-            }
-
-            if (!row.original.camelotKey) return <span className="text-zinc-500">—</span>;
-
+        cell: ({ row }) => {
+          const id = row.original.spotifyId;
+          const inCache = id in featuresById;
+          const loading = loadingTrackId === id && !inCache;
+          if (loading) {
             return (
-              <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-200 border border-emerald-500/20">
-                {row.original.camelotKey}
-              </span>
+              <Loader2 className="mx-auto h-4 w-4 animate-spin text-emerald-200" />
             );
-          })()
-        ),
+          }
+          if (!inCache) {
+            return <span className="text-zinc-500">—</span>;
+          }
+          if (!row.original.camelotKey) {
+            return <span className="text-zinc-400">N/A</span>;
+          }
+          return (
+            <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-200 border border-emerald-500/20">
+              {row.original.camelotKey}
+            </span>
+          );
+        },
       },
     ];
-  }, [loadingTrackId]);
+  }, [loadingTrackId, featuresById]);
 
   const table = useReactTable({
     data: tableTracks,
@@ -407,7 +496,6 @@ export default function Dashboard() {
                       {selectedPlaylist?.name ?? "Select a playlist"}
                     </div>
                   </div>
-                  <p>BPM and Key data provided by <a href="https://getsongbpm.com/">GetSongBPM</a></p>
                 </div>
               </div>
 
@@ -512,7 +600,7 @@ export default function Dashboard() {
                           {table.getRowModel().rows.length === 0 ? (
                             <tr>
                               <td
-                                colSpan={4}
+                                colSpan={6}
                                 className="px-3 py-6 text-center text-zinc-400 text-sm"
                               >
                                 No tracks found.
