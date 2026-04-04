@@ -21,12 +21,12 @@ import {
   Sparkles,
 } from "lucide-react";
 import { camelotKeyToSortIndex, getCamelotKey } from "@/lib/camelot";
-import { fetchPlaylistTracks } from "@/app/actions/spotify";
 import {
   EMPTY_TRACK_FEATURES,
   fetchTrackFeatures,
   type TrackFeatures,
 } from "@/app/actions/getsongbpm";
+import type { SpotifyPlaylistTrack } from "@/lib/spotify-playlist-tracks";
 
 type SpotifyPlaylist = {
   id: string;
@@ -131,7 +131,35 @@ export default function Dashboard() {
     staleTime: 1000 * 60 * 10,
     queryFn: async () => {
       if (!selectedPlaylistId || !accessToken) return [];
-      return fetchPlaylistTracks(selectedPlaylistId, accessToken);
+      const res = await fetch(
+        `/api/spotify/playlists/${encodeURIComponent(selectedPlaylistId)}/tracks`,
+        {
+          credentials: "include",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
+      const data: unknown = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err =
+          typeof data === "object" &&
+          data !== null &&
+          "error" in data &&
+          typeof (data as { error: unknown }).error === "string"
+            ? (data as { error: string }).error
+            : `HTTP ${res.status}`;
+        throw new Error(err);
+      }
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        "tracks" in data &&
+        Array.isArray((data as { tracks: unknown }).tracks)
+      ) {
+        return (data as { tracks: SpotifyPlaylistTrack[] }).tracks;
+      }
+      throw new Error("Invalid response from playlist tracks API");
     },
   });
 
